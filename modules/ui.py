@@ -17,6 +17,8 @@ import modules.metadata
 from modules.face_analyser import (
     get_one_face,
     get_many_faces,
+    detect_one_face_fast,
+    detect_many_faces_fast,
     get_unique_faces_from_target_image,
     get_unique_faces_from_target_video,
     add_blank_map,
@@ -1128,14 +1130,16 @@ def _processing_thread_func(capture_queue, processed_queue, stop_event):
                 last_source_path = modules.globals.source_path
                 source_image = get_one_face(cv2.imread(modules.globals.source_path))
 
-            # Run detection every 3 frames, reuse cached result otherwise
+            # Run detection every 5 frames, reuse cached result otherwise.
+            # At 60fps, 5 frames = 83ms — face position barely changes.
+            # Use fast detection (det-only, no landmark/recognition) for live mode.
             det_count += 1
-            if det_count % 3 == 0:
+            if det_count % 5 == 0:
                 if modules.globals.many_faces:
                     cached_target_face = None
-                    cached_many_faces = get_many_faces(temp_frame)
+                    cached_many_faces = detect_many_faces_fast(temp_frame)
                 else:
-                    cached_target_face = get_one_face(temp_frame)
+                    cached_target_face = detect_one_face_fast(temp_frame)
                     cached_many_faces = None
 
             for frame_processor in frame_processors:
@@ -1197,6 +1201,10 @@ def _processing_thread_func(capture_queue, processed_queue, stop_event):
                 (0, 255, 0),
                 2,
             )
+
+        # BGR→RGB in the processing thread so the display thread gets
+        # a contiguous RGB array (faster PIL.fromarray).
+        temp_frame = cv2.cvtColor(temp_frame, cv2.COLOR_BGR2RGB)
 
         # Put processed frame into output queue, dropping old frames if full
         try:
@@ -1263,16 +1271,16 @@ def create_webcam_preview(camera_index: int):
             return
 
         try:
-            temp_frame = processed_queue.get_nowait()
+            rgb_frame = processed_queue.get_nowait()
         except queue.Empty:
             ROOT.after(1, _display_next_frame)
             return
 
-        temp_frame = fit_image_to_size(
-            temp_frame, PREVIEW.winfo_width(), PREVIEW.winfo_height()
+        # Frame is already RGB from processing thread; resize to preview window
+        rgb_frame = fit_image_to_size(
+            rgb_frame, PREVIEW.winfo_width(), PREVIEW.winfo_height()
         )
-        image = cv2.cvtColor(temp_frame, cv2.COLOR_BGR2RGB)
-        image = Image.fromarray(image)
+        image = Image.fromarray(rgb_frame)
         image = ctk.CTkImage(image, size=image.size)
         preview_label.configure(image=image)
 

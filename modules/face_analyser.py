@@ -160,6 +160,32 @@ def get_many_faces(frame: Frame) -> Any:
     except IndexError:
         return None
 
+def detect_one_face_fast(frame: Frame) -> Any:
+    """Detection-only — skips landmark and recognition models.
+
+    Returns a Face with bbox, kps, det_score (enough for face swap).
+    ~10ms vs ~16ms for full get_one_face() at 1080p.
+    """
+    from insightface.app.common import Face
+    fa = get_face_analyser()
+    bboxes, kpss = fa.det_model.detect(frame, max_num=0, metric='default')
+    if bboxes.shape[0] == 0:
+        return None
+    idx = int(bboxes[:, 0].argmin())
+    return Face(bbox=bboxes[idx, :4], kps=kpss[idx], det_score=bboxes[idx, 4])
+
+
+def detect_many_faces_fast(frame: Frame) -> Any:
+    """Detection-only multi-face — skips landmark and recognition."""
+    from insightface.app.common import Face
+    fa = get_face_analyser()
+    bboxes, kpss = fa.det_model.detect(frame, max_num=0, metric='default')
+    if bboxes.shape[0] == 0:
+        return None
+    return [Face(bbox=bboxes[i, :4], kps=kpss[i], det_score=bboxes[i, 4])
+            for i in range(bboxes.shape[0])]
+
+
 def has_valid_map() -> bool:
     for map in modules.globals.source_target_map:
         if "source" in map and "target" in map:

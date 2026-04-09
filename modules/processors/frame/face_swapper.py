@@ -86,15 +86,16 @@ def get_face_swapper() -> Any:
 
     with THREAD_LOCK:
         if FACE_SWAPPER is None:
-            # Prefer FP32 for broad GPU compatibility (FP16 can produce NaN
-            # on GPUs without Tensor Cores, e.g. GTX 16xx).  Fall back to
-            # FP16 when FP32 is not available.
+            # Prefer FP16 on GPUs with Tensor Cores (Turing+) — half the
+            # memory bandwidth, faster inference.  Fall back to FP32 for
+            # older GPUs (e.g. GTX 16xx) where FP16 can produce NaN.
             fp32_path = os.path.join(models_dir, "inswapper_128.onnx")
             fp16_path = os.path.join(models_dir, "inswapper_128_fp16.onnx")
-            if os.path.exists(fp32_path):
-                model_path = fp32_path
-            elif os.path.exists(fp16_path):
+            use_fp16 = _HAS_TORCH_CUDA and os.path.exists(fp16_path)
+            if use_fp16:
                 model_path = fp16_path
+            elif os.path.exists(fp32_path):
+                model_path = fp32_path
             else:
                 update_status(f"No inswapper model found in {models_dir}.", NAME)
                 return None
@@ -131,6 +132,13 @@ def get_face_swapper() -> Any:
                     model_path,
                     providers=providers_config,
                 )
+                # Set up CUDA graph session for faster inference
+                if _HAS_TORCH_CUDA and any(
+                    p == "CUDAExecutionProvider" or
+                    (isinstance(p, tuple) and p[0] == "CUDAExecutionProvider")
+                    for p in providers_config
+                ):
+                    _init_cuda_graph_session(model_path, FACE_SWAPPER)
                 update_status("Face swapper model loaded successfully.", NAME)
             except Exception as e:
                 update_status(f"Error loading face swapper model: {e}", NAME)
@@ -147,10 +155,87 @@ try:
 except ImportError:
     pass
 
-# Cache for mask geometry — face bbox barely moves between frames
+# Cache for paste-back
 _paste_cache = {
     'mask_white': None,  # pre-allocated white image
 }
+
+# CUDA graph swap session cache
+_cuda_graph_session = {
+    'session': None,
+    'io_binding': None,
+    'ort_input': None,
+    'ort_latent': None,
+    'recorded': False,
+}
+
+
+def _init_cuda_graph_session(model_path: str, swapper):
+    """Create a CUDA-graph-enabled ONNX session for the swap model.
+
+    CUDA graphs record the GPU kernel launch sequence once, then replay it
+    with near-zero CPU overhead on subsequent runs.  Requires static input
+    shapes (inswapper is always 1x3x128x128 + 1x512).
+    """
+    import onnxruntime as ort
+    try:
+        providers = [('CUDAExecutionProvider', {'enable_cuda_graph': '1'})]
+        sess = ort.InferenceSession(model_path, providers=providers)
+
+        # Pre-allocate GPU buffers with correct shapes
+        inp_shape = (1, 3, swapper.input_size[1], swapper.input_size[0])
+        latent_shape = (1, 512)
+        dummy_inp = np.zeros(inp_shape, dtype=np.float32)
+        dummy_lat = np.zeros(latent_shape, dtype=np.float32)
+
+        ort_input = ort.OrtValue.ortvalue_from_numpy(dummy_inp, 'cuda', 0)
+        ort_latent = ort.OrtValue.ortvalue_from_numpy(dummy_lat, 'cuda', 0)
+
+        io = sess.io_binding()
+        io.bind_ortvalue_input(swapper.input_names[0], ort_input)
+        io.bind_ortvalue_input(swapper.input_names[1], ort_latent)
+        io.bind_output(swapper.output_names[0], 'cuda', 0)
+
+        # First run records the CUDA graph
+        sess.run_with_iobinding(io)
+
+        _cuda_graph_session['session'] = sess
+        _cuda_graph_session['io_binding'] = io
+        _cuda_graph_session['ort_input'] = ort_input
+        _cuda_graph_session['ort_latent'] = ort_latent
+        _cuda_graph_session['recorded'] = True
+
+        # Monkey-patch the swapper's session.run to use CUDA graph replay
+        _original_run = swapper.session.run
+
+        def _graph_run(output_names, input_dict, **kwargs):
+            if _cuda_graph_session['recorded']:
+                try:
+                    # input_dict has 'target' (blob) and 'source' (latent)
+                    keys = list(input_dict.keys())
+                    blob = input_dict[keys[0]]
+                    latent = input_dict[keys[1]]
+                    return [_cuda_graph_swap_inference(blob, latent)]
+                except Exception:
+                    pass
+            return _original_run(output_names, input_dict, **kwargs)
+
+        swapper.session.run = _graph_run
+        import sys
+        print(f"[{NAME}] CUDA graph session initialized (swap model)")
+        sys.stdout.flush()
+    except Exception as e:
+        print(f"[{NAME}] CUDA graph init failed, using standard session: {e}")
+        _cuda_graph_session['recorded'] = False
+
+
+def _cuda_graph_swap_inference(blob: np.ndarray, latent: np.ndarray) -> np.ndarray:
+    """Run swap model via CUDA graph replay — minimal CPU overhead."""
+    cg = _cuda_graph_session
+    cg['ort_input'].update_inplace(blob)
+    cg['ort_latent'].update_inplace(latent)
+    cg['session'].run_with_iobinding(cg['io_binding'])
+    return cg['io_binding'].get_outputs()[0].numpy()
 
 
 def _fast_paste_back(target_img: Frame, bgr_fake: np.ndarray, aimg: np.ndarray, M: np.ndarray) -> Frame:
@@ -191,8 +276,7 @@ def _fast_paste_back(target_img: Frame, bgr_fake: np.ndarray, aimg: np.ndarray, 
         y1p, y2p = max(0, y1 - pad), min(h, y2 + pad + 1)
         x1p, x2p = max(0, x1 - pad), min(w, x2 + pad + 1)
 
-        # Warp face and mask into the padded crop region only (not full frame)
-        # Offset the inverse affine to account for crop origin
+        # Warp face and mask into crop region only (CPU — fast on small image)
         IM_crop = IM.copy()
         IM_crop[0, 2] -= x1p
         IM_crop[1, 2] -= y1p
@@ -201,19 +285,27 @@ def _fast_paste_back(target_img: Frame, bgr_fake: np.ndarray, aimg: np.ndarray, 
         bgr_fake_crop = cv2.warpAffine(bgr_fake, IM_crop, (crop_w, crop_h), borderValue=0.0)
         mask_crop = cv2.warpAffine(_paste_cache['mask_white'], IM_crop, (crop_w, crop_h), borderValue=0.0)
 
-        # Erode + blur on small crop
-        mask_crop[mask_crop > 20] = 255
-        mask_crop = cv2.erode(mask_crop, np.ones((k_erode, k_erode), np.uint8), iterations=1)
-        mask_crop = cv2.GaussianBlur(mask_crop, (2*k_blur+1, 2*k_blur+1), 0)
-        mask_crop *= (1.0 / 255.0)
+        # All mask processing + blend on GPU (no CPU roundtrips)
+        mask_t = torch.from_numpy(mask_crop).cuda()
+        mask_t = torch.where(mask_t > 20, 255.0, 0.0)
+        orig_h, orig_w = mask_t.shape
 
-        # GPU blend — transfer only the crop regions
-        mask_t = torch.from_numpy(mask_crop).unsqueeze(2).cuda()
+        # Erode via negative max_pool (equivalent to min_pool)
+        m4 = mask_t.unsqueeze(0).unsqueeze(0)
+        m4 = -torch.nn.functional.max_pool2d(-m4, kernel_size=k_erode, stride=1, padding=k_erode // 2)
+
+        # Gaussian blur approximation via avg_pool
+        bk = 2 * k_blur + 1
+        m4 = torch.nn.functional.avg_pool2d(m4, kernel_size=bk, stride=1, padding=bk // 2)
+
+        # Fix any padding-induced size mismatch
+        m4 = m4[:, :, :orig_h, :orig_w]
+
+        mask_3d = (m4.squeeze() * (1.0 / 255.0)).unsqueeze(2)
         fake_t = torch.from_numpy(bgr_fake_crop).float().cuda()
         tgt_t = torch.from_numpy(target_img[y1p:y2p, x1p:x2p]).float().cuda()
-        blended = (mask_t * fake_t + (1.0 - mask_t) * tgt_t).to(torch.uint8).cpu().numpy()
+        blended = (mask_3d * fake_t + (1.0 - mask_3d) * tgt_t).to(torch.uint8).cpu().numpy()
 
-        # Write directly into target — avoid full frame copy
         target_img[y1p:y2p, x1p:x2p] = blended
         return target_img
     else:
@@ -268,8 +360,8 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
     if not hasattr(source_face, 'normed_embedding') or source_face.normed_embedding is None:
         return temp_frame
 
-    # Copy once — _fast_paste_back writes in-place on GPU path, and
-    # mouth_mask/opacity need an unmodified original.
+    # _fast_paste_back writes in-place on the GPU path.  Only copy when
+    # mouth_mask or opacity < 1 need an unmodified original.
     opacity = getattr(modules.globals, "opacity", 1.0)
     opacity = max(0.0, min(1.0, opacity))
     mouth_mask_enabled = getattr(modules.globals, "mouth_mask", False)
@@ -278,7 +370,6 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
         original_frame = temp_frame.copy()
     else:
         original_frame = temp_frame
-        temp_frame = temp_frame.copy()  # _fast_paste_back writes in-place
 
     if temp_frame.dtype != np.uint8:
         temp_frame = np.clip(temp_frame, 0, 255).astype(np.uint8)
@@ -419,6 +510,14 @@ def get_faces_optimized(frame: Frame, use_cache: bool = True) -> Optional[List[F
 def apply_post_processing(current_frame: Frame, swapped_face_bboxes: List[np.ndarray]) -> Frame:
     """Applies sharpening and interpolation with Apple Silicon optimizations."""
     global PREVIOUS_FRAME_RESULT
+
+    sharpness_value = getattr(modules.globals, "sharpness", 0.0)
+    enable_interpolation = getattr(modules.globals, "enable_interpolation", False)
+
+    # Skip copy when no post-processing is active
+    if sharpness_value <= 0.0 and not enable_interpolation:
+        PREVIOUS_FRAME_RESULT = None
+        return current_frame
 
     processed_frame = current_frame.copy()
 
