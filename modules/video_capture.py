@@ -55,6 +55,8 @@ class VideoCapturer:
             if not self.cap or not self.cap.isOpened():
                 raise RuntimeError("Failed to open camera")
 
+            # Use MJPEG to avoid USB bandwidth limits with uncompressed YUV
+            self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
             # Configure format
             self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
             self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)

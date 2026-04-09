@@ -139,63 +139,120 @@ def get_face_swapper() -> Any:
     return FACE_SWAPPER
 
 
+_HAS_TORCH_CUDA = False
+try:
+    import torch
+    if torch.cuda.is_available():
+        _HAS_TORCH_CUDA = True
+except ImportError:
+    pass
+
+# Cache for mask geometry — face bbox barely moves between frames
+_paste_cache = {
+    'mask_white': None,  # pre-allocated white image
+}
+
+
 def _fast_paste_back(target_img: Frame, bgr_fake: np.ndarray, aimg: np.ndarray, M: np.ndarray) -> Frame:
-    """Optimized paste-back that restricts blending to the face bounding box.
+    """GPU-accelerated paste-back that restricts blending to the face bounding box.
 
     Same visual output as insightface's built-in paste_back, but:
     - Skips dead fake_diff code (computed but unused in insightface)
     - Runs erosion, blur, and blend on the face bbox instead of the full frame
+    - Uses torch CUDA for warpAffine + blend when available
+    - Writes directly into target_img to avoid full-frame copy
     """
     h, w = target_img.shape[:2]
+    face_h, face_w = aimg.shape[:2]
     IM = cv2.invertAffineTransform(M)
 
-    # Warp swapped face and mask to full frame (fast: ~0.4ms each)
-    bgr_fake_full = cv2.warpAffine(bgr_fake, IM, (w, h), borderValue=0.0)
-    img_white = np.full((aimg.shape[0], aimg.shape[1]), 255, dtype=np.float32)
-    img_white_full = cv2.warpAffine(img_white, IM, (w, h), borderValue=0.0)
+    # Reuse pre-allocated white mask
+    if _paste_cache['mask_white'] is None or _paste_cache['mask_white'].shape != (face_h, face_w):
+        _paste_cache['mask_white'] = np.full((face_h, face_w), 255, dtype=np.float32)
 
-    # Find tight bounding box of the warped face mask
-    rows = np.any(img_white_full > 20, axis=1)
-    cols = np.any(img_white_full > 20, axis=0)
-    row_idx = np.where(rows)[0]
-    col_idx = np.where(cols)[0]
-    if len(row_idx) == 0 or len(col_idx) == 0:
+    if _HAS_TORCH_CUDA:
+        # GPU path: compute bbox from affine matrix (avoids warpAffine + scan on white mask)
+        corners = np.array([[0, 0], [face_w, 0], [face_w, face_h], [0, face_h]], dtype=np.float32)
+        transformed = (IM[:, :2] @ corners.T).T + IM[:, 2]
+        x1 = int(np.floor(transformed[:, 0].min()))
+        x2 = int(np.ceil(transformed[:, 0].max()))
+        y1 = int(np.floor(transformed[:, 1].min()))
+        y2 = int(np.ceil(transformed[:, 1].max()))
+        if x1 >= x2 or y1 >= y2:
+            return target_img
+
+        mask_h = y2 - y1
+        mask_w = x2 - x1
+        mask_size = int(np.sqrt(mask_h * mask_w))
+        k_erode = max(mask_size // 10, 10)
+        k_blur = max(mask_size // 20, 5)
+
+        pad = k_erode + k_blur + 2
+        y1p, y2p = max(0, y1 - pad), min(h, y2 + pad + 1)
+        x1p, x2p = max(0, x1 - pad), min(w, x2 + pad + 1)
+
+        # Warp face and mask into the padded crop region only (not full frame)
+        # Offset the inverse affine to account for crop origin
+        IM_crop = IM.copy()
+        IM_crop[0, 2] -= x1p
+        IM_crop[1, 2] -= y1p
+        crop_w, crop_h = x2p - x1p, y2p - y1p
+
+        bgr_fake_crop = cv2.warpAffine(bgr_fake, IM_crop, (crop_w, crop_h), borderValue=0.0)
+        mask_crop = cv2.warpAffine(_paste_cache['mask_white'], IM_crop, (crop_w, crop_h), borderValue=0.0)
+
+        # Erode + blur on small crop
+        mask_crop[mask_crop > 20] = 255
+        mask_crop = cv2.erode(mask_crop, np.ones((k_erode, k_erode), np.uint8), iterations=1)
+        mask_crop = cv2.GaussianBlur(mask_crop, (2*k_blur+1, 2*k_blur+1), 0)
+        mask_crop *= (1.0 / 255.0)
+
+        # GPU blend — transfer only the crop regions
+        mask_t = torch.from_numpy(mask_crop).unsqueeze(2).cuda()
+        fake_t = torch.from_numpy(bgr_fake_crop).float().cuda()
+        tgt_t = torch.from_numpy(target_img[y1p:y2p, x1p:x2p]).float().cuda()
+        blended = (mask_t * fake_t + (1.0 - mask_t) * tgt_t).to(torch.uint8).cpu().numpy()
+
+        # Write directly into target — avoid full frame copy
+        target_img[y1p:y2p, x1p:x2p] = blended
         return target_img
-    y1, y2 = row_idx[0], row_idx[-1]
-    x1, x2 = col_idx[0], col_idx[-1]
+    else:
+        # CPU fallback
+        bgr_fake_full = cv2.warpAffine(bgr_fake, IM, (w, h), borderValue=0.0)
+        img_white_full = cv2.warpAffine(_paste_cache['mask_white'], IM, (w, h), borderValue=0.0)
 
-    # Compute mask/blur kernel sizes from the full mask extent
-    mask_h = y2 - y1
-    mask_w = x2 - x1
-    mask_size = int(np.sqrt(mask_h * mask_w))
-    k_erode = max(mask_size // 10, 10)
-    k_blur = max(mask_size // 20, 5)
+        rows = np.any(img_white_full > 20, axis=1)
+        cols = np.any(img_white_full > 20, axis=0)
+        row_idx = np.where(rows)[0]
+        col_idx = np.where(cols)[0]
+        if len(row_idx) == 0 or len(col_idx) == 0:
+            return target_img
+        y1, y2 = row_idx[0], row_idx[-1]
+        x1, x2 = col_idx[0], col_idx[-1]
 
-    # Add padding for erosion + blur kernels, then crop
-    pad = k_erode + k_blur + 2
-    y1p, y2p = max(0, y1 - pad), min(h, y2 + pad + 1)
-    x1p, x2p = max(0, x1 - pad), min(w, x2 + pad + 1)
+        mask_h = y2 - y1
+        mask_w = x2 - x1
+        mask_size = int(np.sqrt(mask_h * mask_w))
+        k_erode = max(mask_size // 10, 10)
+        k_blur = max(mask_size // 20, 5)
 
-    # Work on cropped region only
-    mask_crop = img_white_full[y1p:y2p, x1p:x2p]
-    mask_crop[mask_crop > 20] = 255
+        pad = k_erode + k_blur + 2
+        y1p, y2p = max(0, y1 - pad), min(h, y2 + pad + 1)
+        x1p, x2p = max(0, x1 - pad), min(w, x2 + pad + 1)
 
-    kernel = np.ones((k_erode, k_erode), np.uint8)
-    mask_crop = cv2.erode(mask_crop, kernel, iterations=1)
+        mask_crop = img_white_full[y1p:y2p, x1p:x2p]
+        mask_crop[mask_crop > 20] = 255
+        mask_crop = cv2.erode(mask_crop, np.ones((k_erode, k_erode), np.uint8), iterations=1)
+        mask_crop = cv2.GaussianBlur(mask_crop, (2*k_blur+1, 2*k_blur+1), 0)
+        mask_crop *= (1.0 / 255.0)
 
-    blur_size = tuple(2 * i + 1 for i in (k_blur, k_blur))
-    mask_crop = cv2.GaussianBlur(mask_crop, blur_size, 0)
-    mask_crop /= 255.0
-
-    # Blend only within the crop
-    mask_3d = mask_crop[:, :, np.newaxis]
-    fake_crop = bgr_fake_full[y1p:y2p, x1p:x2p].astype(np.float32)
-    target_crop = target_img[y1p:y2p, x1p:x2p].astype(np.float32)
-    blended = mask_3d * fake_crop + (1.0 - mask_3d) * target_crop
-
-    result = target_img.copy()
-    result[y1p:y2p, x1p:x2p] = np.clip(blended, 0, 255).astype(np.uint8)
-    return result
+        mask_3d = mask_crop[:, :, np.newaxis]
+        fake_crop = bgr_fake_full[y1p:y2p, x1p:x2p].astype(np.float32)
+        target_crop = target_img[y1p:y2p, x1p:x2p].astype(np.float32)
+        blended = mask_3d * fake_crop + (1.0 - mask_3d) * target_crop
+        result = target_img.copy()
+        result[y1p:y2p, x1p:x2p] = np.clip(blended, 0, 255).astype(np.uint8)
+        return result
 
 
 def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
@@ -211,11 +268,17 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
     if not hasattr(source_face, 'normed_embedding') or source_face.normed_embedding is None:
         return temp_frame
 
-    # Store a copy of the original frame before swapping for opacity blending and mouth mask
+    # Copy once — _fast_paste_back writes in-place on GPU path, and
+    # mouth_mask/opacity need an unmodified original.
     opacity = getattr(modules.globals, "opacity", 1.0)
     opacity = max(0.0, min(1.0, opacity))
     mouth_mask_enabled = getattr(modules.globals, "mouth_mask", False)
-    original_frame = temp_frame.copy() if (opacity < 1.0 or mouth_mask_enabled) else temp_frame
+    needs_original = opacity < 1.0 or mouth_mask_enabled
+    if needs_original:
+        original_frame = temp_frame.copy()
+    else:
+        original_frame = temp_frame
+        temp_frame = temp_frame.copy()  # _fast_paste_back writes in-place
 
     if temp_frame.dtype != np.uint8:
         temp_frame = np.clip(temp_frame, 0, 255).astype(np.uint8)
@@ -241,11 +304,12 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
         if not isinstance(bgr_fake, np.ndarray):
             return original_frame
 
-        # Get the aligned input crop for the mask (same as insightface does internally)
-        aimg, _ = face_align.norm_crop2(temp_frame, target_face.kps, face_swapper.input_size[0])
+        # Pass a dummy aimg with correct shape — _fast_paste_back only uses aimg.shape
+        # to create the white mask. Avoids redundant norm_crop2 (~0.6ms).
+        _face_size = face_swapper.input_size[0]
+        _aimg_dummy = np.empty((_face_size, _face_size, 3), dtype=np.uint8)
 
-        swapped_frame = _fast_paste_back(temp_frame, bgr_fake, aimg, M)
-        swapped_frame = np.clip(swapped_frame, 0, 255).astype(np.uint8)
+        swapped_frame = _fast_paste_back(temp_frame, bgr_fake, _aimg_dummy, M)
 
     except Exception as e:
         print(f"Error during face swap: {e}")

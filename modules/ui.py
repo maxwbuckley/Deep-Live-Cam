@@ -1216,7 +1216,7 @@ def create_webcam_preview(camera_index: int):
     global preview_label, PREVIEW
 
     cap = VideoCapturer(camera_index)
-    if not cap.start(PREVIEW_DEFAULT_WIDTH, PREVIEW_DEFAULT_HEIGHT, 60):
+    if not cap.start(1920, 1080, 60):
         update_status("Failed to start camera")
         return
 
@@ -1254,7 +1254,9 @@ def create_webcam_preview(camera_index: int):
         PREVIEW.withdraw()
 
     # Non-blocking display loop using ROOT.after() — avoids blocking the
-    # Tk event loop which could cause UI freezes or re-entrancy issues
+    # Tk event loop which could cause UI freezes or re-entrancy issues.
+    # Uses a short interval (1ms) so frames are displayed as soon as they
+    # arrive from the processing thread, rather than waiting up to 16ms.
     def _display_next_frame():
         if stop_event.is_set() or PREVIEW.state() == "withdrawn":
             _cleanup()
@@ -1263,27 +1265,18 @@ def create_webcam_preview(camera_index: int):
         try:
             temp_frame = processed_queue.get_nowait()
         except queue.Empty:
-            ROOT.after(16, _display_next_frame)
+            ROOT.after(1, _display_next_frame)
             return
 
-        if modules.globals.live_resizable:
-            temp_frame = fit_image_to_size(
-                temp_frame, PREVIEW.winfo_width(), PREVIEW.winfo_height()
-            )
-        else:
-            temp_frame = fit_image_to_size(
-                temp_frame, PREVIEW.winfo_width(), PREVIEW.winfo_height()
-            )
-        temp_frame = temp_frame.copy()
-        image = gpu_cvt_color(temp_frame, cv2.COLOR_BGR2RGB)
-        image = Image.fromarray(image)
-        image = ImageOps.contain(
-            image, (temp_frame.shape[1], temp_frame.shape[0]), Image.LANCZOS
+        temp_frame = fit_image_to_size(
+            temp_frame, PREVIEW.winfo_width(), PREVIEW.winfo_height()
         )
+        image = cv2.cvtColor(temp_frame, cv2.COLOR_BGR2RGB)
+        image = Image.fromarray(image)
         image = ctk.CTkImage(image, size=image.size)
         preview_label.configure(image=image)
 
-        ROOT.after(16, _display_next_frame)
+        ROOT.after(1, _display_next_frame)
 
     # Kick off the non-blocking display loop
     ROOT.after(0, _display_next_frame)
