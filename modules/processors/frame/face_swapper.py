@@ -98,9 +98,15 @@ def get_face_swapper() -> Any:
             else:
                 update_status(f"No inswapper model found in {models_dir}.", NAME)
                 return None
+            # On Apple Silicon, rewrite Pad(reflect) → Slice+Concat so
+            # CoreML can run the entire model in a single partition on
+            # the Neural Engine instead of bouncing between CPU and ANE.
+            if IS_APPLE_SILICON:
+                from modules.onnx_optimize import optimize_for_coreml
+                model_path = optimize_for_coreml(model_path)
+
             update_status(f"Loading face swapper model from: {model_path}", NAME)
             try:
-                # Optimized provider configuration for Apple Silicon
                 providers_config = []
                 for p in modules.globals.execution_providers:
                     if p == "CoreMLExecutionProvider" and IS_APPLE_SILICON:
