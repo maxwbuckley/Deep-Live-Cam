@@ -72,8 +72,24 @@ def _optimize_det_model(fa: Any, providers) -> None:
     session_options.graph_optimization_level = (
         onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
     )
+
+    # Route detection to GPU shader cores (CPUAndGPU) instead of ANE.
+    # This lets detection run concurrently with the swap model on the
+    # ANE, overlapping the two inference calls.  Detection is fast
+    # enough on GPU (~4ms) and this frees ANE for the heavier swap.
+    det_providers = []
+    for p in providers:
+        name = p[0] if isinstance(p, tuple) else p
+        if name == "CoreMLExecutionProvider":
+            det_providers.append((
+                "CoreMLExecutionProvider",
+                {"ModelFormat": "MLProgram", "MLComputeUnits": "CPUAndGPU"},
+            ))
+        else:
+            det_providers.append(p)
+
     det_model.session = onnxruntime.InferenceSession(
-        optimized_path, sess_options=session_options, providers=providers,
+        optimized_path, sess_options=session_options, providers=det_providers,
     )
 
 
