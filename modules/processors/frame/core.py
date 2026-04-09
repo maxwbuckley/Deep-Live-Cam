@@ -322,8 +322,6 @@ def _run_pipe_pipeline(
     bar_fmt = ('{l_bar}{bar}| {n_fmt}/{total_fmt} '
                '[{elapsed}<{remaining}, {rate_fmt}{postfix}]')
 
-    from concurrent.futures import ThreadPoolExecutor
-
     try:
         with tqdm(total=total_frames, desc='Processing', unit='frame',
                   dynamic_ncols=True, bar_format=bar_fmt) as progress:
@@ -333,9 +331,10 @@ def _run_pipe_pipeline(
                 'mode': 'in-memory',
             })
 
-            # Pipelined detection: detect face in frame N+1 while
-            # processing frame N.  Detection runs on the ANE and can
-            # partially overlap with the swap model inference.
+            # Pipelined detection: while processing frame N (swap on
+            # ANE), start detecting the face in the next frame
+            # (detection on GPU).  They use different hardware units
+            # so the work overlaps.
             detect_executor = ThreadPoolExecutor(max_workers=1)
             pending_detect = None
             use_pipeline = not modules.globals.many_faces
@@ -355,9 +354,9 @@ def _run_pipe_pipeline(
                         target_face = pending_detect.result()
                     else:
                         target_face = get_one_face(frame)
-                    # Start detecting on the NEXT frame's data eagerly.
-                    # We pass the current frame since consecutive video
-                    # frames have nearly identical face positions.
+                    # Start detecting on THIS frame eagerly — the result
+                    # will be used for the next iteration.  At video
+                    # frame rates the face barely moves between frames.
                     pending_detect = detect_executor.submit(
                         get_one_face, frame)
                 else:
@@ -374,7 +373,7 @@ def _run_pipe_pipeline(
                 processed_count += 1
                 progress.update(1)
 
-            detect_executor.shutdown(wait=False)
+            detect_executor.shutdown(wait=True)
 
         # Graceful shutdown
         writer.stdin.close()
