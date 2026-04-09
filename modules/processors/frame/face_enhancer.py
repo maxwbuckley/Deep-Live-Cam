@@ -82,26 +82,10 @@ def get_face_enhancer() -> onnxruntime.InferenceSession:
 
             try:
                 from modules.processors.frame._onnx_enhancer import (
-                    build_provider_config,
-                )
-                providers = build_provider_config()
-
-                # On Apple Silicon, optimize the ONNX graph for CoreML
-                from modules.onnx_optimize import optimize_for_coreml
-                model_path = optimize_for_coreml(
-                    model_path, input_shape=(1, 3, 512, 512),
+                    create_onnx_session,
                 )
 
-                session_options = onnxruntime.SessionOptions()
-                session_options.graph_optimization_level = (
-                    onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
-                )
-
-                FACE_ENHANCER = onnxruntime.InferenceSession(
-                    model_path,
-                    sess_options=session_options,
-                    providers=providers,
-                )
+                FACE_ENHANCER = create_onnx_session(model_path)
 
                 input_info = FACE_ENHANCER.get_inputs()[0]
                 output_info = FACE_ENHANCER.get_outputs()[0]

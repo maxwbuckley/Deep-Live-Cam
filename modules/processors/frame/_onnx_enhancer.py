@@ -91,7 +91,26 @@ def run_inference(session: onnxruntime.InferenceSession,
 
 
 def create_onnx_session(model_path: str) -> onnxruntime.InferenceSession:
-    """Create an ONNX Runtime session with optimised provider config."""
+    """Create an ONNX Runtime session with optimised provider config.
+
+    On Apple Silicon, applies CoreML graph optimizations (Pad decomposition,
+    Shape/Gather folding, Split decomposition) to reduce CPU↔ANE partition
+    boundaries.
+    """
+    if IS_APPLE_SILICON:
+        from modules.onnx_optimize import optimize_for_coreml
+        # Infer input shape from the model for Shape/Gather folding
+        try:
+            import onnx
+            m = onnx.load(model_path)
+            inp = m.graph.input[0]
+            dims = inp.type.tensor_type.shape.dim
+            shape = tuple(d.dim_value for d in dims if d.dim_value > 0)
+            input_shape = shape if len(shape) == 4 else None
+        except Exception:
+            input_shape = None
+        model_path = optimize_for_coreml(model_path, input_shape=input_shape)
+
     providers = build_provider_config()
     session_options = onnxruntime.SessionOptions()
     session_options.graph_optimization_level = (
