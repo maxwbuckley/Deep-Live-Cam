@@ -1,7 +1,6 @@
 import os
 import shutil
-from concurrent.futures import ThreadPoolExecutor
-from typing import Any, List, Optional
+from typing import Any
 import insightface
 import threading
 
@@ -16,10 +15,6 @@ from pathlib import Path
 
 FACE_ANALYSER = None
 FACE_ANALYSER_LOCK = threading.Lock()
-
-# Thread pool for running landmark + recognition in parallel
-_MODEL_EXECUTOR = ThreadPoolExecutor(max_workers=2)
-
 
 DET_SIZE = (640, 640)
 
@@ -101,15 +96,9 @@ def _needs_landmark() -> bool:
     """
     if getattr(modules.globals, "mouth_mask", False):
         return True
-    fp_ui = getattr(modules.globals, "fp_ui", {})
-    for key in ("face_enhancer", "face_enhancer_gpen256", "face_enhancer_gpen512"):
-        if fp_ui.get(key, False):
-            return True
     processors = getattr(modules.globals, "frame_processors", [])
-    for key in ("face_enhancer", "face_enhancer_gpen256", "face_enhancer_gpen512"):
-        if key in processors:
-            return True
-    return False
+    return any(p in processors for p in
+               ("face_enhancer", "face_enhancer_gpen256", "face_enhancer_gpen512"))
 
 
 def _is_dml() -> bool:
@@ -117,47 +106,34 @@ def _is_dml() -> bool:
 
 
 def _analyse_faces(frame: Frame) -> list:
-    """Run face detection then landmark + recognition, parallelising where possible.
+    """Run face detection, then recognition (and optionally landmark).
 
-    InsightFace's default ``FaceAnalysis.get()`` runs all post-detection
-    models sequentially.  Landmark and recognition are independent of each
-    other (both only need the detection bbox/kps), so we run them in
-    parallel.  When landmarks aren't needed (swap-only pipeline), we skip
-    that model entirely.
+    Replaces InsightFace's ``FaceAnalysis.get()`` to skip the
+    landmark_2d_106 model when only face_swapper is active (saves ~1ms
+    per face and avoids an unnecessary ONNX session call).
     """
     fa = get_face_analyser()
 
-    # --- 1. Detection (always required) ---
     bboxes, kpss = fa.det_model.detect(frame, max_num=0, metric="default")
     if bboxes.shape[0] == 0:
         return []
 
     need_landmark = _needs_landmark()
-
-    # Look up post-detection models once
     rec_model = fa.models.get("recognition")
     lmk_model = fa.models.get("landmark_2d_106") if need_landmark else None
 
-    # --- 2. Build Face objects and run post-detection models ---
     from insightface.app.common import Face
 
     faces = []
     for i in range(bboxes.shape[0]):
-        face = Face(bbox=bboxes[i, 0:4], kps=kpss[i] if kpss is not None else None, det_score=bboxes[i, 4])
-        faces.append(face)
-
-    for face in faces:
-        if lmk_model is not None and rec_model is not None:
-            # Run landmark and recognition in parallel — they are
-            # independent and use different ONNX sessions.
-            lmk_future = _MODEL_EXECUTOR.submit(lmk_model.get, frame, face)
-            rec_future = _MODEL_EXECUTOR.submit(rec_model.get, frame, face)
-            lmk_future.result()
-            rec_future.result()
-        elif rec_model is not None:
+        face = Face(bbox=bboxes[i, 0:4],
+                    kps=kpss[i] if kpss is not None else None,
+                    det_score=bboxes[i, 4])
+        if rec_model is not None:
             rec_model.get(frame, face)
-        elif lmk_model is not None:
+        if lmk_model is not None:
             lmk_model.get(frame, face)
+        faces.append(face)
 
     return faces
 
