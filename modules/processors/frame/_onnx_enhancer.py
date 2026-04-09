@@ -36,23 +36,11 @@ def build_provider_config(providers=None):
             # Already configured – pass through
             config.append(p)
         elif p == "CUDAExecutionProvider":
-            config.append((
-                "CUDAExecutionProvider",
-                {
-                    # Re-use freed blocks instead of growing the arena
-                    "arena_extend_strategy": "kSameAsRequested",
-                    # One-time exhaustive search for the fastest cuDNN
-                    # convolution algorithm (significant speed-up after
-                    # the first inference pass)
-                    "cudnn_conv_algo_search": "EXHAUSTIVE",
-                    # Allow cuDNN to use more workspace memory for faster
-                    # convolution kernels
-                    "cudnn_conv_use_max_workspace": "1",
-                    # Use a separate CUDA stream for host↔device copies so
-                    # they can overlap with compute kernels
-                    "do_copy_in_default_stream": "0",
-                },
-            ))
+            # Use bare provider — ONNX Runtime's defaults are fastest on
+            # modern GPUs (Blackwell/sm_120).  Custom options like
+            # EXHAUSTIVE cudnn_conv_algo_search hurt performance on these
+            # architectures.
+            config.append(p)
         elif p == "CoreMLExecutionProvider" and IS_APPLE_SILICON:
             config.append((
                 "CoreMLExecutionProvider",

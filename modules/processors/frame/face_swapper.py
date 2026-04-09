@@ -109,15 +109,9 @@ def get_face_swapper() -> Any:
                             }
                         ))
                     elif p == "CUDAExecutionProvider":
-                        providers_config.append((
-                            "CUDAExecutionProvider",
-                            {
-                                "arena_extend_strategy": "kSameAsRequested",
-                                "cudnn_conv_algo_search": "EXHAUSTIVE",
-                                "cudnn_conv_use_max_workspace": "1",
-                                "do_copy_in_default_stream": "0",
-                            }
-                        ))
+                        # Use bare provider — ONNX Runtime defaults are
+                        # fastest on modern GPUs (Blackwell/sm_120).
+                        providers_config.append(p)
                     else:
                         providers_config.append(p)
                 FACE_SWAPPER = insightface.model_zoo.get_model(
