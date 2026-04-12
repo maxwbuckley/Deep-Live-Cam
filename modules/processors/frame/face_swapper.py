@@ -342,9 +342,9 @@ def _fast_paste_back(target_img: Frame, bgr_fake: np.ndarray, aimg: np.ndarray, 
         fake_crop = bgr_fake_full[y1p:y2p, x1p:x2p].astype(np.float32)
         target_crop = target_img[y1p:y2p, x1p:x2p].astype(np.float32)
         blended = mask_3d * fake_crop + (1.0 - mask_3d) * target_crop
-        result = target_img.copy()
-        result[y1p:y2p, x1p:x2p] = np.clip(blended, 0, 255).astype(np.uint8)
-        return result
+        # Write in-place, consistent with the GPU path
+        target_img[y1p:y2p, x1p:x2p] = np.clip(blended, 0, 255).astype(np.uint8)
+        return target_img
 
 
 def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:

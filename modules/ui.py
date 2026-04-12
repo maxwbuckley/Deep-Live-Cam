@@ -1099,10 +1099,16 @@ def _capture_thread_func(cap, capture_queue, stop_event):
                 pass
 
 
-def _processing_thread_func(capture_queue, processed_queue, stop_event):
+def _processing_thread_func(capture_queue, processed_queue, stop_event,
+                            camera_fps: float = 30.0):
     """Processing thread: takes raw frames from capture_queue, runs face
-    detection (throttled to every 3rd frame), applies face swap/enhancement,
-    and puts results into processed_queue."""
+    detection (throttled), applies face swap/enhancement, and puts results
+    into processed_queue.
+
+    Args:
+        camera_fps: Actual camera frame rate — used to compute how many
+            frames to skip between face detections (~80ms target).
+    """
     frame_processors = get_frame_processors_modules(modules.globals.frame_processors)
     source_image = None
     last_source_path = None
@@ -1113,6 +1119,9 @@ def _processing_thread_func(capture_queue, processed_queue, stop_event):
     det_count = 0
     cached_target_face = None
     cached_many_faces = None
+    # Detect every N frames ≈ 80ms.  At 60fps → every 5 frames (83ms),
+    # at 30fps → every 3 frames (100ms), at 15fps → every frame.
+    det_interval = max(1, round(camera_fps * 0.08))
 
     while not stop_event.is_set():
         try:
@@ -1130,11 +1139,10 @@ def _processing_thread_func(capture_queue, processed_queue, stop_event):
                 last_source_path = modules.globals.source_path
                 source_image = get_one_face(cv2.imread(modules.globals.source_path))
 
-            # Run detection every 5 frames, reuse cached result otherwise.
-            # At 60fps, 5 frames = 83ms — face position barely changes.
+            # Run detection every det_interval frames (~80ms).
             # Use fast detection (det-only, no landmark/recognition) for live mode.
             det_count += 1
-            if det_count % 5 == 0:
+            if det_count % det_interval == 0:
                 if modules.globals.many_faces:
                     cached_target_face = None
                     cached_many_faces = detect_many_faces_fast(temp_frame)
@@ -1142,16 +1150,26 @@ def _processing_thread_func(capture_queue, processed_queue, stop_event):
                     cached_target_face = detect_one_face_fast(temp_frame)
                     cached_many_faces = None
 
+            # Build face list for enhancers from cached detection
+            _cached_faces = None
+            if cached_many_faces:
+                _cached_faces = cached_many_faces
+            elif cached_target_face is not None:
+                _cached_faces = [cached_target_face]
+
             for frame_processor in frame_processors:
                 if frame_processor.NAME == "DLC.FACE-ENHANCER":
                     if modules.globals.fp_ui["face_enhancer"]:
-                        temp_frame = frame_processor.process_frame(None, temp_frame)
+                        temp_frame = frame_processor.process_frame(
+                            None, temp_frame, detected_faces=_cached_faces)
                 elif frame_processor.NAME == "DLC.FACE-ENHANCER-GPEN256":
                     if modules.globals.fp_ui.get("face_enhancer_gpen256", False):
-                        temp_frame = frame_processor.process_frame(None, temp_frame)
+                        temp_frame = frame_processor.process_frame(
+                            None, temp_frame, detected_faces=_cached_faces)
                 elif frame_processor.NAME == "DLC.FACE-ENHANCER-GPEN512":
                     if modules.globals.fp_ui.get("face_enhancer_gpen512", False):
-                        temp_frame = frame_processor.process_frame(None, temp_frame)
+                        temp_frame = frame_processor.process_frame(
+                            None, temp_frame, detected_faces=_cached_faces)
                 elif frame_processor.NAME == "DLC.FACE-SWAPPER":
                     # Use cached face positions from detection thread
                     swapped_bboxes = []
@@ -1228,6 +1246,9 @@ def create_webcam_preview(camera_index: int):
         update_status("Failed to start camera")
         return
 
+    camera_fps = cap.actual_fps
+    print(f"[webcam] Camera running at {cap.actual_width}x{cap.actual_height}@{camera_fps:.0f}fps")
+
     preview_label.configure(width=PREVIEW_DEFAULT_WIDTH, height=PREVIEW_DEFAULT_HEIGHT)
     PREVIEW.deiconify()
 
@@ -1248,7 +1269,7 @@ def create_webcam_preview(camera_index: int):
     # Start processing thread
     proc_thread = threading.Thread(
         target=_processing_thread_func,
-        args=(capture_queue, processed_queue, stop_event),
+        args=(capture_queue, processed_queue, stop_event, camera_fps),
         daemon=True,
     )
     proc_thread.start()
@@ -1261,10 +1282,12 @@ def create_webcam_preview(camera_index: int):
         cap.release()
         PREVIEW.withdraw()
 
+    # Poll at ~2x camera FPS (Nyquist) so we pick up frames promptly
+    # without burning CPU.  Clamped to [1, 16] ms.
+    poll_ms = max(1, min(16, int(500 / camera_fps)))
+
     # Non-blocking display loop using ROOT.after() — avoids blocking the
     # Tk event loop which could cause UI freezes or re-entrancy issues.
-    # Uses a short interval (1ms) so frames are displayed as soon as they
-    # arrive from the processing thread, rather than waiting up to 16ms.
     def _display_next_frame():
         if stop_event.is_set() or PREVIEW.state() == "withdrawn":
             _cleanup()
@@ -1273,7 +1296,7 @@ def create_webcam_preview(camera_index: int):
         try:
             rgb_frame = processed_queue.get_nowait()
         except queue.Empty:
-            ROOT.after(1, _display_next_frame)
+            ROOT.after(poll_ms, _display_next_frame)
             return
 
         # Frame is already RGB from processing thread; resize to preview window
@@ -1284,7 +1307,7 @@ def create_webcam_preview(camera_index: int):
         image = ctk.CTkImage(image, size=image.size)
         preview_label.configure(image=image)
 
-        ROOT.after(1, _display_next_frame)
+        ROOT.after(poll_ms, _display_next_frame)
 
     # Kick off the non-blocking display loop
     ROOT.after(0, _display_next_frame)
