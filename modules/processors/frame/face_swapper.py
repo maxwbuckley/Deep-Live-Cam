@@ -1,7 +1,7 @@
 from typing import Any, List, Optional
 import cv2
 import insightface
-from insightface.utils import face_align
+import logging
 import threading
 import numpy as np
 import platform

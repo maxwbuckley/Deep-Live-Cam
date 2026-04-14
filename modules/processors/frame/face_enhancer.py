@@ -1,4 +1,3 @@
-# --- START OF FILE face_enhancer.py ---
 # Uses ONNX Runtime for GFPGAN face enhancement (no torch/gfpgan dependency)
 
 from typing import Any, List
@@ -437,6 +436,3 @@ def process_video(
     modules.processors.frame.core.process_video(
         source_path, temp_frame_paths, process_frames
     )
-
-
-# --- END OF FILE face_enhancer.py ---
