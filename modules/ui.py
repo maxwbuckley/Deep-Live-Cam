@@ -1100,7 +1100,8 @@ def _capture_thread_func(cap, capture_queue, stop_event):
 
 
 def _processing_thread_func(capture_queue, processed_queue, stop_event,
-                            camera_fps: float = 30.0):
+                            camera_fps: float = 30.0,
+                            fps_holder: list = None):
     """Processing thread: takes raw frames from capture_queue, runs face
     detection (throttled), applies face swap/enhancement, and puts results
     into processed_queue.
@@ -1108,6 +1109,9 @@ def _processing_thread_func(capture_queue, processed_queue, stop_event,
     Args:
         camera_fps: Actual camera frame rate — used to compute how many
             frames to skip between face detections (~80ms target).
+        fps_holder: Single-element list used to publish the latest measured
+            processing FPS to the display thread, which overlays it after
+            resize so the text stays legible at any preview window size.
     """
     frame_processors = get_frame_processors_modules(modules.globals.frame_processors)
     source_image = None
@@ -1201,24 +1205,16 @@ def _processing_thread_func(capture_queue, processed_queue, stop_event,
                 else:
                     temp_frame = frame_processor.process_frame_v2(temp_frame)
 
-        # Calculate and display FPS
+        # Update processing FPS; the display thread draws the overlay after
+        # resize so it stays a consistent pixel size at any window size.
         current_time = time.time()
         frame_count += 1
         if current_time - prev_time >= fps_update_interval:
             fps = frame_count / (current_time - prev_time)
             frame_count = 0
             prev_time = current_time
-
-        if modules.globals.show_fps:
-            cv2.putText(
-                temp_frame,
-                f"FPS: {fps:.1f}",
-                (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                1,
-                (0, 255, 0),
-                2,
-            )
+            if fps_holder is not None:
+                fps_holder[0] = fps
 
         # Queue the processed frame as BGR; the display thread resizes to the
         # preview window first and then runs cvtColor on the (much smaller)
@@ -1255,6 +1251,7 @@ def create_webcam_preview(camera_index: int):
     capture_queue = queue.Queue(maxsize=2)
     processed_queue = queue.Queue(maxsize=2)
     stop_event = threading.Event()
+    fps_holder = [0.0]
 
     # Start capture thread
     cap_thread = threading.Thread(
@@ -1267,7 +1264,7 @@ def create_webcam_preview(camera_index: int):
     # Start processing thread
     proc_thread = threading.Thread(
         target=_processing_thread_func,
-        args=(capture_queue, processed_queue, stop_event, camera_fps),
+        args=(capture_queue, processed_queue, stop_event, camera_fps, fps_holder),
         daemon=True,
     )
     proc_thread.start()
@@ -1302,6 +1299,16 @@ def create_webcam_preview(camera_index: int):
         bgr_frame = fit_image_to_size(
             bgr_frame, PREVIEW.winfo_width(), PREVIEW.winfo_height()
         )
+        if modules.globals.show_fps:
+            cv2.putText(
+                bgr_frame,
+                f"FPS: {fps_holder[0]:.1f}",
+                (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1,
+                (0, 255, 0),
+                2,
+            )
         rgb_frame = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
         image = Image.fromarray(rgb_frame)
         image = ctk.CTkImage(image, size=image.size)
