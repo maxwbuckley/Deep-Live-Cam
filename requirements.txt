@@ -1,6 +1,8 @@
-numpy>=1.23.5,<2
+numpy>=1.23.5,<2; python_version < '3.13'
+numpy>=2.1.0,<3; python_version >= '3.13'
 typing-extensions>=4.8.0
-opencv-python==4.10.0.84
+opencv-python==4.10.0.84; python_version < '3.13'
+opencv-python>=4.11.0,<5; python_version >= '3.13'
 cv2_enumerate_cameras==1.1.15
 onnx==1.18.0
 insightface==0.7.3
@@ -8,10 +10,14 @@ psutil==5.9.8
 PySide6>=6.7,<7
 pillow==12.1.1
 tqdm>=4.65.0
+requests>=2.31.0
+scikit-learn>=1.3.0
 onnxruntime==1.26.0; sys_platform == 'darwin' and platform_machine == 'arm64'
 onnxruntime-gpu==1.26.0; sys_platform != 'darwin'
-tensorflow>=2.15.0; sys_platform != 'darwin'
+tensorflow>=2.15.0,<2.20; sys_platform != 'darwin' and python_version < '3.13'
+tensorflow>=2.20.0; sys_platform != 'darwin' and python_version >= '3.13'
 tensorflow>=2.15.0; sys_platform == 'darwin' and python_version < '3.13'
 opennsfw2==0.10.2
-protobuf==4.25.1
+protobuf==4.25.1; python_version < '3.13'
+protobuf>=5.28.0; python_version >= '3.13'
 pygrabber; sys_platform == 'win32'
